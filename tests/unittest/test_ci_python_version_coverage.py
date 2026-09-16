@@ -3,8 +3,9 @@
 `requires-python = ">=3.12"` on its own is open-ended, but the per-interpreter
 dependency pins say which minors support is actually claimed for -- currently
 google-cloud-storage, split at `python_version >= '3.13'` for #2480. CI used to
-run only inside docker/Dockerfile's python:3.12.14-slim base, so 3.13 was
-declared and never tested (#3187).
+run only inside docker/Dockerfile's base image, so whichever minor that image
+did not carry went declared and never tested (#3187). The base has since moved
+to 3.14 (#3294), which is why both declared minors now need native jobs.
 
 These tests assert the repository's CI configuration, not pr_agent logic, hence a
 file of their own. They read the checked-in workflow and Dockerfile, which the
@@ -42,12 +43,15 @@ def _tested_python_versions() -> set[str]:
     """Minors build-and-test.yaml runs the unit suite on.
 
     The Dockerfile base counts because the workflow builds its ``test`` target and
-    runs pytest inside it; native jobs pin their interpreter on the uv command line
-    or through setup-python.
+    runs pytest inside it; native jobs pin their interpreter on the uv command line,
+    through setup-python, or over a matrix. Matrix legs are read from the strategy
+    rather than the step, because the step only carries the expression.
     """
     versions = set(DOCKER_BASE_VERSION.findall(DOCKERFILE.read_text(encoding="utf-8")))
     workflow = yaml.safe_load(BUILD_AND_TEST_WORKFLOW.read_text(encoding="utf-8"))
     for job in workflow["jobs"].values():
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
+        versions.update(str(leg) for leg in matrix.get("python-version", []))
         for step in job.get("steps", []):
             versions.update(UV_PYTHON_FLAG.findall(step.get("run", "")))
             pinned = (step.get("with") or {}).get("python-version")
