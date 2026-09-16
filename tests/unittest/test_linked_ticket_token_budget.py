@@ -121,7 +121,14 @@ def test_oversized_ticket_payload_keeps_diff_budget_and_raw_cache(monkeypatch):
         }
     }
 
-    result = generate_full_patch(True, file_dict, max_tokens, ["src/app.py"], handler)
+    result = generate_full_patch(
+        True,
+        file_dict,
+        max_tokens - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD - handler.prompt_tokens,
+        ["src/app.py"],
+        handler,
+        hard_token_budget=max_tokens - 1_000 - handler.prompt_tokens,
+    )
 
     assert result[1] == [f"\n\n{patch}"]
     assert result[2] == []
@@ -204,6 +211,8 @@ async def test_tools_use_the_same_bounded_ticket_vars_for_packing_and_rendering(
 
     async def get_prediction(_model, *_args, **_kwargs):
         rendered_vars.append(tool.vars)
+        if tool_name == "review":
+            return "review:\n  summary: prediction"
         return "prediction"
 
     monkeypatch.setattr(module, "fit_related_tickets_to_prompt_budget", fit_payload)
@@ -258,7 +267,8 @@ async def test_description_large_pr_fits_each_prompt_from_raw_tickets(monkeypatc
     async def get_prediction(_model, patches_diff=None, prompt=None):
         prediction_calls.append((prompt, patches_diff, tool.vars))
         if prompt == "pr_description_only_files_prompts":
-            return "pr_files:\n- filename: src/app.py"
+            return ("pr_files:\n- filename: src/app.py\n  changes_title: Update app\n"
+                    "  changes_summary: Updates app behavior.\n  label: enhancement")
         return "title: Test\ndescription: Test"
 
     monkeypatch.setattr(module, "fit_related_tickets_to_prompt_budget", fit_payload)

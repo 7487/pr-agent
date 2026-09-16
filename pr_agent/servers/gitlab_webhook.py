@@ -23,6 +23,7 @@ from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.secret_providers import get_secret_provider, validate_secret_provider_setting
 from pr_agent.servers.utils import get_pr_commands, push_trigger_slot
+from pr_agent.telemetry.prometheus import attach_metrics_endpoint, prometheus_metrics_enabled
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
@@ -55,6 +56,14 @@ async def handle_request(api_url: str, body: str, log_context: dict, sender_id: 
     log_context["event"] = "pull_request" if body == "/review" else "comment"
     log_context["api_url"] = api_url
     log_context["app_name"] = get_settings().get("CONFIG.APP_NAME", "Unknown")
+
+    # Comment commands can pass arbitrary arguments, so sibling-repo context is authorized
+    # against the commenter (the command actor) instead of the MR author. Fail closed when no
+    # trustworthy account can be recorded (e.g. the "unknown" fallback for missing sender data).
+    if isinstance(sender_id, int) and sender_id:
+        provider = get_git_provider_with_context(pr_url=api_url)
+        if hasattr(provider, "set_command_actor"):
+            provider.set_command_actor(sender_id)
 
     with get_logger().contextualize(**log_context):
         await PRAgent().handle_request(api_url, body, notify)
@@ -497,6 +506,8 @@ if not gitlab_url:
     raise ValueError("GITLAB.URL is not set")
 get_settings().config.git_provider = "gitlab"
 middleware = [Middleware(RawContextMiddleware)]
+if prometheus_metrics_enabled():
+    attach_metrics_endpoint(router)
 app = FastAPI(middleware=middleware)
 app.include_router(router)
 

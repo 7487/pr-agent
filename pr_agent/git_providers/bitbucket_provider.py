@@ -64,6 +64,7 @@ class BitbucketProvider(GitProvider):
         self.headers = s.headers
         self.bitbucket_client = Cloud(session=s)
         self.max_comment_length = 31000
+        self.max_comment_chars = self.max_comment_length
         self.workspace_slug = None
         self.repo_slug = None
         self.repo = None
@@ -71,6 +72,7 @@ class BitbucketProvider(GitProvider):
         self.pr = None
         self.pr_url = pr_url
         self.temp_comments = []
+        self._published_inline_comment_bodies = []
         self.incremental = incremental
         self.diff_files = None
         self.git_files = None
@@ -121,19 +123,22 @@ class BitbucketProvider(GitProvider):
     def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
         # Read from the PR destination (target) branch, matching the other providers,
         # or from the repository default branch when from_default_branch is requested.
-        branch = self.get_repo_default_branch() if from_default_branch else self.pr.destination_branch
+        branch = self.get_repo_context_ref(from_default_branch)
         return self.get_pr_file_content(file_path, branch, propagate_errors=True)
+
+    def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
+        return self.get_repo_default_branch() if from_default_branch else self.pr.destination_branch
 
     def get_git_repo_url(self, pr_url: str=None) -> str: #bitbucket does not support issue url, so ignore param
         try:
             parsed_url = urlparse(self.pr_url)
             return f"{parsed_url.scheme}://{parsed_url.netloc}/{self.workspace_slug}/{self.repo_slug}.git"
-        except Exception as e:
+        except Exception:
             get_logger().exception(f"url is not a valid merge requests url: {self.pr_url}")
             return ""
 
     # Given a git repo url, return prefix and suffix of the provider in order to view a given file belonging to that repo.
-    # Example: git clone git clone https://bitbucket.org/pragent/pr-agent.git and branch: main -> prefix: "https://bitbucket.org/pragent/pr-agent/src/main", suffix: ""
+    # Example: git clone https://bitbucket.org/pragent/pr-agent.git and branch: main -> prefix: "https://bitbucket.org/pragent/pr-agent/src/main", suffix: ""
     # In case git url is not provided, provider will use PR context (which includes branch) to determine the prefix and suffix.
     def get_canonical_url_parts(self, repo_git_url:str=None, desired_branch:str=None) -> Tuple[str, str]:
         scheme_and_netloc = None
@@ -219,12 +224,8 @@ class BitbucketProvider(GitProvider):
             get_logger().error(f"Bitbucket failed to publish code suggestion, error: {e}")
             return False
 
-    def publish_file_comments(self, file_comments: list) -> bool:
-        pass
-
     def is_supported(self, capability: str) -> bool:
-        if capability in ['publish_inline_comments', 'get_labels',
-                  'gfm_markdown', 'publish_file_comments']:
+        if capability in ['publish_inline_comments', 'get_labels', 'gfm_markdown']:
             return False
         if capability == "push_code" and get_settings().config.restricted_mode:
             return False
@@ -264,7 +265,7 @@ class BitbucketProvider(GitProvider):
                     'names_filtered': names_filtered
 
                 })
-            except Exception as e:
+            except Exception:
                 pass
 
         # get the pr patches
@@ -375,6 +376,13 @@ class BitbucketProvider(GitProvider):
             return comment._cloud_comment
         return comment
 
+    def get_comment_url(self, comment):
+        comment = self._get_cloud_comment(comment)
+        return comment.data["links"]["html"]["href"]
+
+    def supports_html_comment_markers(self) -> bool:
+        return False
+
     def supports_review_comment_identity(self) -> bool:
         return True
 
@@ -387,28 +395,6 @@ class BitbucketProvider(GitProvider):
         except Exception as e:
             get_logger().exception(f"Failed to update comment, error: {e}")
             return False
-
-    def publish_persistent_comment(
-        self,
-        pr_comment: str,
-        initial_header: str,
-        update_header: bool = True,
-        name='review',
-        final_update_message=True,
-        as_thread: bool = False,
-        identity_marker: str | None = None,
-        legacy_initial_header: str | None = None,
-    ):
-        return self.publish_persistent_comment_full(
-            pr_comment,
-            initial_header,
-            update_header,
-            name,
-            final_update_message,
-            as_thread=as_thread,
-            identity_marker=identity_marker,
-            legacy_initial_header=legacy_initial_header,
-        )
 
     def publish_comment(self, pr_comment: str, is_temporary: bool = False):
         if is_temporary and not get_settings().config.publish_output_progress:
@@ -453,7 +439,6 @@ class BitbucketProvider(GitProvider):
 
     def publish_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str | int,
                                original_suggestion=None) -> bool:
-        body = self.limit_output_characters(body, self.max_comment_length)
         # The base contract passes the line's text; publish_inline_comments passes an already resolved line number.
         if not isinstance(relevant_line_in_file, int):
             comment = self.create_inline_comment(body, relevant_file, relevant_line_in_file)
@@ -462,14 +447,23 @@ class BitbucketProvider(GitProvider):
                                    "to publish an inline comment")
                 return False
             relevant_file, relevant_line_in_file = comment["path"], comment["position"]
+        return self._post_inline_comment(body, relevant_file, relevant_line_in_file)
+
+    def _post_inline_comment(self, body: str, relevant_file: str, from_line: int, to_line: int = None) -> bool:
+        # Bitbucket Cloud anchors a span with 'start_to' and 'to'. Anything that is not a real
+        # span is posted as a single-line comment.
+        body = self.limit_output_characters(body, self.max_comment_length)
+        if isinstance(to_line, int) and to_line > from_line:
+            inline = {"start_to": from_line, "to": to_line, "path": relevant_file}
+            location = f"lines {from_line}-{to_line}"
+        else:
+            inline = {"to": from_line, "path": relevant_file}
+            location = f"line {from_line}"
         payload = json.dumps({
             "content": {
                 "raw": body,
             },
-            "inline": {
-                "to": relevant_line_in_file,
-                "path": relevant_file
-            },
+            "inline": inline,
         })
         try:
             response = requests.request(
@@ -478,8 +472,14 @@ class BitbucketProvider(GitProvider):
             response.raise_for_status()
         except Exception as e:
             get_logger().error(
-                f"Failed to publish inline comment to '{relevant_file}' at line {relevant_line_in_file}, error: {e}")
+                f"Failed to publish inline comment to '{relevant_file}' at {location}, error: {e}")
             return False
+        recent_bodies = getattr(self, "_published_inline_comment_bodies", None)
+        if recent_bodies is None:
+            recent_bodies = []
+            self._published_inline_comment_bodies = recent_bodies
+        if body not in recent_bodies:
+            recent_bodies.append(body)
         return True
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
@@ -513,11 +513,12 @@ class BitbucketProvider(GitProvider):
         publishable_count = 0
         published_count = 0
         for comment in comments:
+            to_line = None
             if 'position' in comment:
                 from_line = comment['position']
             elif 'start_line' in comment:  # multi-line comment
-                # note that bitbucket does not seem to support range - only a comment on a single line - https://community.developer.atlassian.com/t/api-post-endpoint-for-inline-pull-request-comments/60452
                 from_line = comment['start_line']
+                to_line = comment.get('line')
             elif 'line' in comment:  # single-line comment
                 from_line = comment['line']
             else:
@@ -525,7 +526,7 @@ class BitbucketProvider(GitProvider):
                 continue
 
             publishable_count += 1
-            if self.publish_inline_comment(comment['body'], comment['path'], from_line):
+            if self._post_inline_comment(comment['body'], comment['path'], from_line, to_line):
                 published_count += 1
 
         # A partial failure must not report failure: the caller republishes the whole
@@ -536,8 +537,8 @@ class BitbucketProvider(GitProvider):
         return self.pr.title
 
     def get_languages(self):
-        languages = {self._get_repo().get_data("language"): 0}
-        return languages
+        language = self._get_repo().get_data("language")
+        return {language: 0} if language else {}
 
     def get_pr_branch(self):
         return self.pr.source_branch
@@ -582,6 +583,19 @@ class BitbucketProvider(GitProvider):
             )
 
         return comments
+
+    def get_persistent_comment_bodies(self) -> list[str]:
+        """Return existing Bitbucket Cloud comment bodies for inline deduplication."""
+        bodies = list(getattr(self, "_published_inline_comment_bodies", []))
+        for comment in self.get_issue_comments():
+            body = getattr(comment, "body", "")
+            if body and body not in bodies:
+                bodies.append(body)
+        return bodies
+
+    def get_recent_inline_comment_bodies(self) -> list[str]:
+        """Return inline comment bodies published during this provider run."""
+        return list(getattr(self, "_published_inline_comment_bodies", []))
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
         return True

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import os
 import re
+from collections import Counter
 from types import SimpleNamespace
 from typing import Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
@@ -19,7 +19,7 @@ from ..algo.inline_comment_dedup import (
     get_inline_comment_store,
     has_marker,
 )
-from ..algo.language_handler import is_valid_file
+from ..algo.language_handler import build_language_file_matcher, is_valid_file
 from ..algo.utils import (
     PRCodeSuggestionsIdentity,
     PRDescriptionHeader,
@@ -480,6 +480,9 @@ class AzureDevopsProvider(GitProvider):
     def supports_thread_resolution(self) -> bool:
         return True
 
+    def supports_linked_work_item_tickets(self) -> bool:
+        return True
+
     def set_pr(self, pr_url: str):
         self.diff_files = None
         self._diff_path_map = None
@@ -727,6 +730,13 @@ class AzureDevopsProvider(GitProvider):
             if _is_not_found_error(e):
                 return ""
             raise
+
+    def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
+        # The PR target (base) commit is the cached revision; the default branch is selected by
+        # omitting the version, so it carries no explicit ref, mirroring get_repo_file_content.
+        if from_default_branch:
+            return None
+        return self.pr.last_merge_target_commit.commit_id
 
     def get_files(self):
         if (isinstance(getattr(self, "incremental", None), IncrementalPR)
@@ -976,23 +986,6 @@ class AzureDevopsProvider(GitProvider):
             self.temp_comments.append(created_comment)
         return created_comment
 
-    def publish_persistent_comment(self, pr_comment: str,
-                                   initial_header: str,
-                                   update_header: bool = True,
-                                   name='review',
-                                   final_update_message=True,
-                                   identity_marker: str | None = None,
-                                   legacy_initial_header: str | None = None):
-        return self.publish_persistent_comment_full(
-            pr_comment,
-            initial_header,
-            update_header,
-            name,
-            final_update_message,
-            identity_marker=identity_marker,
-            legacy_initial_header=legacy_initial_header,
-        )
-
     def supports_review_comment_identity(self) -> bool:
         return True
 
@@ -1167,7 +1160,24 @@ class AzureDevopsProvider(GitProvider):
         return self.pr.title
 
     def get_languages(self):
-        languages = []
+        # Return {language name: percentage}, like the other providers. Keys are
+        # language NAMES (e.g. "Python"), not raw extensions: the consumer
+        # sort_files_by_main_languages() maps each name back to its extensions, so
+        # returning extensions ("py") silently drops every file into the "Other"
+        # bucket and defeats the prioritisation. Use the shared configured
+        # filename matcher so all providers apply the same rules. Percentages are
+        # computed over the repository's blob inventory (not the PR change set),
+        # so transient files or untouched files in the PR cannot skew the ranking.
+        lang_map = get_settings().get("language_extension_map_org", {}) or {}
+        get_language = build_language_file_matcher(lang_map)
+
+        # Azure may omit merge metadata for a PR; without a target commit there is no
+        # reliable revision to enumerate, so mirror the empty-map fallback used by the
+        # other providers for unrecognized repositories.
+        target_commit = getattr(self.pr, "last_merge_target_commit", None)
+        if target_commit is None or not getattr(target_commit, "commit_id", None):
+            return {}
+
         files = self.azure_devops_client.get_items(
             project=self.workspace_slug,
             repository_id=self.repo_slug,
@@ -1175,25 +1185,21 @@ class AzureDevopsProvider(GitProvider):
             include_content_metadata=True,
             include_links=False,
             download=False,
+            version_descriptor=GitVersionDescriptor(
+                version=target_commit.commit_id, version_type="commit"
+            ),
         )
+
+        lang_count = Counter()
         for f in files:
-            if f.git_object_type == "blob":
-                file_name, file_extension = os.path.splitext(f.path)
-                languages.append(file_extension[1:])
+            if f.git_object_type != "blob" or not f.path:
+                continue
+            language = get_language(f.path)
+            if language:
+                lang_count[language] += 1
 
-        extension_counts = {}
-        for ext in languages:
-            if ext != "":
-                extension_counts[ext] = extension_counts.get(ext, 0) + 1
-
-        total_extensions = sum(extension_counts.values())
-
-        extension_percentages = {
-            ext: (count / total_extensions) * 100
-            for ext, count in extension_counts.items()
-        }
-
-        return extension_percentages
+        total = sum(lang_count.values()) or 1
+        return {lang: count / total * 100 for lang, count in lang_count.items()}
 
     def get_pr_branch(self):
         pr_info = self.azure_devops_client.get_pull_request_by_id(
@@ -1651,9 +1657,6 @@ class AzureDevopsProvider(GitProvider):
             if get_verbosity_level() >= 2:
                 get_logger().info(f"Failed to get PR id, error: {e}")
             return ""
-
-    def publish_file_comments(self, file_comments: list) -> bool:
-        pass
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
         return self.pr_url+f"?_a=files&path={relevant_file}"

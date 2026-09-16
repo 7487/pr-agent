@@ -123,7 +123,14 @@ class PRUpdateChangelog:
                 self.git_provider.publish_comment(changelog_comment)
 
     async def _prepare_prediction(self, model: str):
-        self.patches_diff = get_pr_diff(self.git_provider, self.token_handler, model)
+        self.patches_diff = get_pr_diff(
+            self.git_provider,
+            self.token_handler,
+            model,
+            output_token_reserve=getattr(
+                getattr(self, "ai_handler", None), "get_output_token_reserve", None
+            ),
+        )
         if self.patches_diff:
             get_logger().debug("PR diff", artifact=self.patches_diff)
             self.prediction = await self._get_prediction(model)
@@ -167,6 +174,11 @@ class PRUpdateChangelog:
         return new_file_content, answer
 
     def _push_changelog_update(self, new_file_content, answer):
+        if not self.git_provider.is_supported("push_code"):
+            # Its only caller already gates on self.commit_changelog, which is False
+            # whenever this capability is missing; kept local so the guard holds even
+            # if a future caller reaches this method some other way.
+            return
         if get_settings().pr_update_changelog.get("skip_ci_on_push", True):
             commit_message = "[skip ci] Update CHANGELOG.md"
         else:
@@ -180,7 +192,7 @@ class PRUpdateChangelog:
 
         sleep(5)  # wait for the file to be updated
         try:
-            if get_settings().config.git_provider == "github":
+            if self.git_provider.supports_changelog_update_review():
                 last_commit_id = list(self.git_provider.pr.get_commits())[-1]
                 d = dict(
                     body="CHANGELOG.md update",

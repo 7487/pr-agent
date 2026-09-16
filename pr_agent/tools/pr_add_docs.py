@@ -72,6 +72,8 @@ class PRAddDocs:
                 self.push_inline_docs(data)
         except Exception as e:
             get_logger().error(f"Failed to generate code documentation for PR, error: {e}")
+            if get_settings().config.get("propagate_tool_errors", False):
+                raise
 
     async def _prepare_prediction(self, model: str):
         get_logger().info('Getting PR diff...')
@@ -80,7 +82,10 @@ class PRAddDocs:
                                         self.token_handler,
                                         model,
                                         add_line_numbers_to_hunks=True,
-                                        disable_extra_lines=False)
+                                        disable_extra_lines=False,
+                                        output_token_reserve=getattr(
+                                            getattr(self, "ai_handler", None), "get_output_token_reserve", None
+                                        ))
 
         get_logger().info('Getting AI prediction...')
         self.prediction = await self._get_prediction(model)
@@ -104,6 +109,10 @@ class PRAddDocs:
         data = load_yaml(docs)
         if isinstance(data, list):
             data = {'Code Documentation': data}
+        if not isinstance(data, dict) or not isinstance(data.get('Code Documentation'), list):
+            get_logger().warning("The model did not return a Code Documentation list",
+                                 artifact={'prediction': docs})
+            return {'Code Documentation': []}
         return data
 
     def push_inline_docs(self, data):
